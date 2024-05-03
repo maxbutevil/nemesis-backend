@@ -1,10 +1,21 @@
 // @generated automatically by Diesel CLI.
 
 diesel::table! {
-    impressions (user_id, profile_id) {
-        user_id -> Text,
-        profile_id -> Text,
-        liked -> Integer,
+    matches (user1, user2) {
+        user1 -> Text,
+        user2 -> Text,
+        state -> Integer,
+    }
+}
+
+diesel::table! {
+    messages (id) {
+        id -> Integer,
+        user1 -> Text,
+        user2 -> Text,
+        sender -> Integer,
+        time -> Text,
+        content -> Text,
     }
 }
 
@@ -25,6 +36,7 @@ diesel::table! {
 }
 
 diesel::allow_tables_to_appear_in_same_query!(
-    impressions,
+    matches,
+    messages,
     users,
 );

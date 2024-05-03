@@ -1,9 +1,14 @@
 
-
+use crate::Id;
 use crate::schema;
 use crate::models::{
 	User,
-	Profile
+	Match,
+	ChatMessage,
+	
+	Profile,
+	Sender,
+	MatchState
 };
 
 use diesel::prelude::*;
@@ -42,6 +47,12 @@ impl DatabaseState {
 		
 	}
 	
+	fn strip<T>(option: Option<T>) -> Option<()> {
+		match option {
+			Some(_) => Some(()),
+			None => None
+		}
+	}
 	async fn execute_result<T, E, F>(&self, query: F) -> Option<Result<T, E>>
 	where
 		F: Send + 'static + FnOnce(&mut SqliteConnection) -> Result<T, E>,
@@ -96,67 +107,15 @@ impl DatabaseState {
 		
 	}
 	
-	
-	pub async fn write_user(&self, user: User) -> Option<()> {
-		
-		use schema::users::dsl::*;
-		
-		let result = self.execute_expect(
-			"Error on user write", 
-			move |connection| {
-				update(users.find(&user.id))
-					.set(&user)
-					.execute(connection)
-		}).await;
-		
-		match result {
-			Some(_) => Some(()),
-			None => None
-		}
-		
-		/*
-		match result {
-			Some(Ok(_)) => Ok(()),
-			Some(Err(err)) => {
-				println!("Error on user write: {err}");
-				Err(())
-			}
-			None => Err(())
-		}
-		*/
-		
-	}
-	
-	
-	
-	/*
-	pub async fn select_user(&self, user_id: String) -> Option<Result<User, diesel::result::Error>> {
-		
-		use schema::users::dsl::*;
-		
-		self.execute(move |connection| {
-			users.find(user_id)
-				.select(User::as_select())
-				.first(connection)
-		}).await
-		
-	}
-	pub async fn get_user(&self, user_id: String) -> Option<User> {
-		Self::flatten(self.select_user(user_id).await)
-	}
-	pub async fn get_user_loud(&self, user_id: String, message: &'static str) -> Option<User> {
-		Self::flatten_loud(self.select_user(user_id).await, message)
-	}
-	*/
-	
-	pub async fn read_user(&self, user_id: String) -> Option<User> {
+	pub async fn read_user(&self, user_id: Id) -> Option<User> {
 		
 		use schema::users::{self, dsl::*};
 		
 		let id_clone = user_id.clone();
 		let result = self.execute(move |connection| {
-			users.find(id_clone)
+			users
 				.select(User::as_select())
+				.find(&*id_clone)
 				.first(connection)
 		}).await;
 		
@@ -170,7 +129,7 @@ impl DatabaseState {
 			"Error inserting user on read",
 			move |connection|
 				insert_into(users::table)
-					.values(id.eq(id_clone))
+					.values(id.eq(&*id_clone))
 					.execute(connection)
 		).await;
 		
@@ -180,31 +139,80 @@ impl DatabaseState {
 		}
 		
 	}
+	pub async fn write_user(&self, user: User) -> Option<()> {
+		
+		use schema::users;
+		
+		Self::strip(self.execute_expect(
+			"Error on user write", 
+			move |connection| {
+				update(users::table.find(&user.id))
+					.set(&user)
+					.execute(connection)
+		}).await)
+		
+	}
 	
-	pub async fn get_profiles(&self, _user_id: String) -> Option<Vec<Profile>> {
+	pub async fn get_profile(&self, user_id: Id) -> Option<Profile> {
 		
-		//let user_result = self.get_user_(user_id.clone());
+		use schema::users;
 		
-		//use schema::users::self;
+		let result: Option<User> = self.execute_expect(
+			"Error getting profile",
+			move |connection|
+				users::table
+					.select(User::as_select())
+					.find(&*user_id)
+					.first(connection)
+		).await;
 		
-		let result = self.execute_expect(
-			"Error getting matches",
-			|connection| {
+		match result {
+			Some(user) => Some(user.to_profile()),
+			None => None
+		}
+		
+	}
+	pub async fn get_profiles(&self, user_id: Id) -> Option<Vec<Profile>> {
+		
+		use schema::users::{self, dsl::*};
+		use schema::matches::{self, dsl::*};
+		
+		let result: Option<Vec<User>> = self.execute_expect(
+			"Error getting candidate profiles",
+			move |connection| {
 				
-				use schema::users;
+				let two_liked_one = MatchState::to_i32(&MatchState::Pending(Sender::Two));
+				let one_liked_two = MatchState::to_i32(&MatchState::Pending(Sender::One));
+				
+				let ineligible_one = {
+					matches::table
+						.select(user2)
+						.filter(user1.eq(&*user_id))
+						.filter(state.ne(two_liked_one)) // allow unreciprocated likes from others
+				};
+				
+				let ineligible_two = {
+					matches::table
+						.select(user1)
+						.filter(user2.eq(&*user_id))
+						.filter(state.ne(one_liked_two)) // allow unreciprocated likes from others
+				};
 				
 				users::table
-					//.filter(id.ne(user_id))
-					.limit(5)
 					.select(User::as_select())
+					.filter(id.ne(&*user_id))
+					.filter(id.ne_all(ineligible_one))
+					.filter(id.ne_all(ineligible_two))
+					.limit(5)
 					.load::<User>(connection)
+				
 			}).await;
 			
 		match result {
 			None => None,
-			Some(users) => {
+			Some(candidate_users) => {
 				Some(
-					users
+					candidate_users
 						.into_iter()
 						.map(move |user| user.to_profile())
 						.collect()
@@ -214,77 +222,98 @@ impl DatabaseState {
 		
 	}
 	
-	/*
-	pub async fn write_profile(&self, profile: Profile) -> Result<(), ()> {
+	pub async fn get_match_state(&self, id1: Id, id2: Id) -> Option<MatchState> {
 		
-		use schema::profiles::{self};//, dsl::*};
+		//let (id1, id2) = (id1.clone(), id2.clone());
+		let (id1, id2) = Match::order(id1, id2);
 		
-		let result = self.execute(move |connection| {
-			/*
-			insert_into(profiles::table)
-				.values(&profile)
-				.on_conflict(id)
-				.do_update()
-				.set(&profile)
-				.execute(connection)
-			*/
-			update(profiles::table.find(&profile.id))
-				.set(&profile)
-				.execute(connection)
-		}).await;
+		use schema::matches::{self, dsl::state};
+		
+		let result = self.execute(
+			move |connection|
+				matches::table
+					.select(state)
+					.find((&**id1, &**id2))
+					.first::<i32>(connection)
+		).await;
 		
 		match result {
-			Some(Ok(_)) => return Ok(()),
-			Some(Err(err)) => println!("{err}"),
-			_ => {}
+			Some(i) => MatchState::from_i32(i),
+			None => None
 		}
 		
-		Err(())
+	}
+	pub async fn set_match_state(&self, id1: Id, id2: Id, new_state: MatchState) -> Option<()> {
+		
+		use schema::matches::{self, dsl::*};
+		
+		let (id1, id2) = Match::order(id1, id2);
+		let new_state_i32 = MatchState::to_i32(&new_state);
+		let new_match = Match::new(&id1, &id2, new_state);
+		
+		let result = self.execute_expect(
+			"Error setting match state",
+			move |connection|
+				insert_into(matches::table)
+					.values(&new_match)
+					.on_conflict((user1, user2))
+					.do_update()
+					.set(state.eq(new_state_i32))
+					.execute(connection)
+		).await;
+		
+		match result {
+			Some(_) => Some(()),
+			None => None
+		}
 		
 	}
 	
-	pub async fn read_profile(&self, user_id: String) -> Option<Profile> {
+	pub async fn put_message(&self, sender_id: Id, receiver_id: Id, content: String) -> Option<()> {
 		
-		use schema::profiles::{self, dsl::*};
+		use schema::messages::{self, dsl};
 		
-		let id_clone = user_id.clone();
-		let result = self.execute(move |connection| {
-			profiles
-				.find(id_clone)
-				.select(Profile::as_select())
-				.first(connection)
-		}).await;
+		let sender = Sender::get(&sender_id, &receiver_id);
+		let (id1, id2) = Match::order(sender_id, receiver_id);
+		
+		let result = self.execute_expect(
+			"Error inserting chat message",
+			move |connection|
+				insert_into(messages::table)
+					.values((
+						dsl::user1.eq(&**id1),
+						dsl::user2.eq(&**id2),
+						dsl::sender.eq(Sender::to_i32(&sender)),
+						dsl::content.eq(&content)
+					))
+					.execute(connection)
+		).await;
 		
 		match result {
-			Some(Ok(profile)) => return Some(profile),
-			Some(Err(err)) => println!("{err}"),
-			_ => {}
+			Some(_) => Some(()),
+			None => None
 		}
 		
-		// If profile doesn't exist, let's try to create it
-		let id_clone = user_id.clone();
-		let result = self.execute(move |connection| {
-			insert_into(profiles::table)
-				.values(id.eq(id_clone))
-				.execute(connection)
-		}).await;
+	}
+	pub async fn get_chat_messages(&self, user1: Id, user2: Id, limit: i64, older_than: String) -> Option<Vec<ChatMessage>> {
 		
-		match result {
-			Some(Ok(count)) => {
-				if count > 0 {
-					return Some(Profile::new(user_id));
-				} else {
-					println!("Error on profile read insert")
-				}
-			},
-			Some(Err(err)) => println!("{err}"),
-			_ => {}
-		};
+		use schema::messages::{self, dsl};
 		
-		None
+		let (id1, id2) = Match::order(user1, user2);
+		
+		self.execute_expect(
+			"Error getting chat history",
+			move |connection|
+				messages::table
+					.select(ChatMessage::as_select())
+					.filter(dsl::user1.eq(&*id1))
+					.filter(dsl::user2.eq(&*id2))
+					.filter(dsl::time.lt(older_than))
+					.limit(limit)
+					.load::<ChatMessage>(connection)
+		).await
 		
 	}
-	*/
 	
 }
 
