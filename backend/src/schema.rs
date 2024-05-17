@@ -10,11 +10,11 @@ diesel::table! {
 
 diesel::table! {
     messages (id) {
-        id -> Integer,
+        id -> Text,
         user1 -> Text,
         user2 -> Text,
         sender -> Integer,
-        time -> Text,
+        timestamp -> Text,
         content -> Text,
     }
 }

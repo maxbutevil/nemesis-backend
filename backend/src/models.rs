@@ -1,44 +1,19 @@
 
 use crate::Id;
-use diesel::prelude::*;
-use serde::{
-	self,
-	Serialize, Serializer,
-	Deserialize, Deserializer
-};
-
-//use serde_json::Result;
-//mod schema;
-
 use crate::schema::*;
 
-/*
-#[derive(Debug)]
-#[derive(Queryable, Selectable, Insertable)]
-#[derive(Deserialize)]
-#[diesel(table_name = schema::users)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
-pub struct User {
-	pub username: String,
-	pub password: String,
-}
-*/
+use diesel::prelude::*;
+use diesel::backend::Backend;
+use diesel::expression::AsExpression;
+use diesel::sql_types::Integer;
+use diesel::deserialize::{self,	FromSql, FromSqlRow};
+use diesel::serialize::{self,	ToSql, Output};
+
+use serde::{Serialize, Deserialize};
+
+
 
 fn empty_string() -> String { "".to_string() }
-/*
-fn i32_to_bool(i: i32) -> bool { i != 0 }
-fn bool_to_i32(b: bool) -> i32 { b as i32 }
-
-fn serialize_bool<S: Serializer>(i: &i32, s: S) -> Result<S::Ok, S::Error> {
-  s.serialize_bool(i32_to_bool(*i))
-}
-fn deserialize_bool<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
-	match bool::deserialize(d) {
-		Ok(b) => Ok(bool_to_i32(b)),
-		Err(err) => Err(err)
-	}
-}
-*/
 
 
 #[derive(Debug, Default)]
@@ -94,13 +69,30 @@ impl User {
 		}
 	}
 	
-	pub fn to_profile<'a>(self) -> Profile {
+	fn distance_to_user(&self, other: &User) -> Option<usize> {
+		// This is not even slightly accurate
+		// Aggressively ballparking until I get around to improving it
+		match (self.latitude, self.longitude, other.latitude, other.longitude) {
+			(Some(lat1), Some(long1), Some(lat2), Some(long2)) => {
+				let dlat = lat1 - lat2;
+				let dlong = long1 - long2;
+				Some((f32::sqrt(dlat * dlat + dlong * dlong)/60.0) as usize)
+			}
+			_ => None
+		}
+		
+	}
+	pub fn to_profile(self/* , for_user: &User */) -> Profile {
+		
+		//let distance = self.distance_to_user(for_user);
 		
 		Profile {
 			
 			id: self.id,
 			
 			/* DERIVED */
+			// Calculating these in a secure way is honestly very annoying
+			distance: None,
 			age: None,
 			
 			/* VITALS */
@@ -132,6 +124,8 @@ pub struct Profile {
 	/* DERIVED */
 	// distance?
 	#[serde(skip_serializing_if = "Option::is_none")]
+	pub distance: Option<usize>,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub age: Option<usize>,
 	
 	/* VITALS */
@@ -157,19 +151,16 @@ pub struct Profile {
 
 
 
-#[derive(PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
+#[derive(AsExpression, FromSqlRow)]
+#[diesel(sql_type = Integer)]
 pub enum Sender {
 	One,
 	Two
 }
-pub enum MatchState {
-	Dead,
-	Pending(Sender),
-	Active
-}
 impl Sender {
 	
-	pub fn get(sender_id: &Id, receiver_id: &Id) -> Self {
+	pub fn of(sender_id: &Id, receiver_id: &Id) -> Self {
 		
 		if sender_id < receiver_id {
 			Self::One
@@ -178,67 +169,138 @@ impl Sender {
 		}
 		
 	}
-	pub fn to_i32(sender: &Self) -> i32 {
-		match sender {
-			Self::One => 0,
-			Self::Two => 1
-		}
-	}
-	pub fn from_i32(i: i32) -> Option<Self> {
-		match i {
-			0 => Some(Self::One),
-			1 => Some(Self::Two),
-			invalid => {
-				println!("Invalid match state: {}", invalid);
-				None
-			}
+	
+	pub fn other(&self) -> Sender {
+		match self {
+			Sender::One => Sender::Two,
+			Sender::Two => Sender::One
 		}
 	}
 	
 }
-impl MatchState {
+impl<DB> ToSql<Integer, DB> for Sender
+	where DB: Backend, i32: ToSql<Integer, DB> {
+  fn to_sql<'a>(&'a self, out: &mut Output<'a, '_, DB>) -> serialize::Result {
+    match self {
+			Sender::One => 0.to_sql(out),
+			Sender::Two => 1.to_sql(out)
+		}
+  }
+}
+impl<DB> FromSql<Integer, DB> for Sender
+	where DB: Backend, i32: FromSql<Integer, DB> {
 	
-	pub fn from_i32(i: i32) -> Option<Self> {
-		match i {
-			0 => Some(Self::Dead),
-			1 => Some(Self::Active),
-			2 => Some(Self::Pending(Sender::One)),
-			3 => Some(Self::Pending(Sender::Two)),
+	fn from_sql(bytes: DB::RawValue<'_>) -> deserialize::Result<Self> {
+		match i32::from_sql(bytes)? {
+			0 => Ok(Sender::One),
+			1 => Ok(Sender::Two),
+			other => Err(format!("Invalid Sender variant: {other}").into())
+		}
+	}
+	
+}
+
+
+
+#[derive(Debug, Clone)]
+#[derive(AsExpression, FromSqlRow)]
+#[diesel(sql_type = Integer)]
+pub enum MatchState {
+	Dead,
+	Pending(Sender),
+	Active
+}
+impl<DB: Backend> ToSql<Integer, DB> for MatchState
+	where i32: ToSql<Integer, DB> {
+  fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, DB>) -> serialize::Result {
+    match *self {
+			MatchState::Dead => 0.to_sql(out),
+			MatchState::Active => 1.to_sql(out),
+			MatchState::Pending(Sender::One) => 2.to_sql(out),
+			MatchState::Pending(Sender::Two) => 3.to_sql(out)
+		}
+  }
+}
+impl<DB: Backend> FromSql<Integer, DB> for MatchState 
+	where i32: FromSql<Integer, DB> {
+	fn from_sql(bytes: DB::RawValue<'_>) -> deserialize::Result<Self> {
+		match i32::from_sql(bytes)? {
+			0 => Ok(MatchState::Dead),
+			1 => Ok(MatchState::Active),
+			2 => Ok(MatchState::Pending(Sender::One)),
+			3 => Ok(MatchState::Pending(Sender::Two)),
+			other => Err(format!("Invalid MatchState variant: {other}").into())
+		}
+	}
+	
+}
+
+
+
+
+/*
+impl Into<i32> for MatchState {
+	
+	fn into(self) -> i32 {
+		match self {
+			MatchState::Dead => 0,
+			MatchState::Active => 1,
+			MatchState::Pending(Sender::One) => 2,
+			MatchState::Pending(Sender::Two) => 3
+		}
+	}
+	
+}
+impl Into<MatchState> for i32 {
+	
+	fn into(self) -> MatchState {
+		
+		match self {
+			0 => MatchState::Dead,
+			1 => MatchState::Active,
+			2 => MatchState::Pending(Sender::One),
+			3 => MatchState::Pending(Sender::Two),
 			invalid => {
 				println!("Invalid match state: {}", invalid);
-				None
+				MatchState::Dead
 			}
 		}
+		
 	}
-	pub fn to_i32(state: &Self) -> i32 {
-		match state {
-			Self::Dead => 0,
-			Self::Active => 1,
-			Self::Pending(Sender::One) => 2,
-			Self::Pending(Sender::Two) => 3,
-		}
-	}
+	
 }
+*/
+
+/*
+impl Serialize for MatchState {
+	
+}
+impl Deserialize for MatchState {
+	
+}
+*/
+
 
 
 #[derive(Debug)]
-#[derive(Serialize, Deserialize)]
+//#[derive(Serialize, Deserialize)]
 #[derive(Queryable, Selectable, Insertable)]
 //#[derive(AsChangeset)]
 #[diesel(table_name = matches)]
+//#[diesel(belongs_to(User))]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+//#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Match {
 	
 	//#[serde(default = "empty_string")]
 	pub user1: String,
 	pub user2: String,
 	
-	pub state: i32,
+	//pub state: i32,
+	pub state: MatchState
 	
 }
 impl Match {
-	
 	
 	pub fn order<T>(one: T, two: T) -> (T, T)
 		where T: PartialOrd<T>
@@ -250,59 +312,68 @@ impl Match {
 		}
 	}
 	
-	
-	
-	pub fn get_state(&self) -> Option<MatchState> {
-		MatchState::from_i32(self.state)
-	}
-	pub fn set_state(&mut self, new_state: MatchState) {
-		self.state = MatchState::to_i32(&new_state)
-	}
-	
-	
-	
 	fn new_unchecked(user1: &Id, user2: &Id, state: MatchState) -> Self {
 		Self {
-			user1: (**user1).clone(),
-			user2: (**user2).clone(),
-			state: MatchState::to_i32(&state)
+			user1: user1.to_string(),
+			user2: user2.to_string(),
+			state //MatchState::to_i32(&state)
 		}
 	}
 	pub fn new(user1: &Id, user2: &Id, state: MatchState) -> Self {
 		let (user1, user2) = Self::order(user1, user2);
 		Self::new_unchecked(user1, user2, state)
 	}
-	pub fn new_dead(user1: &Id, user2: &Id) -> Self {
+	/*pub fn new_dead(user1: &Id, user2: &Id) -> Self {
 		Self::new(user1, user2, MatchState::Dead)
 	}
 	pub fn new_liked(sender_id: &Id, receiver_id: &Id) -> Self {
 		Self::new(
 			sender_id, receiver_id,
-			MatchState::Pending(Sender::get(sender_id, receiver_id))
+			MatchState::Pending(Sender::of(sender_id, receiver_id))
 		)
-	}
+	}*/
 	
 }
 
 
 #[derive(Debug)]
-#[derive(Serialize, Deserialize)]
+//#[derive(Serialize, Deserialize)]
 #[derive(Queryable, Selectable, Insertable)]
 #[diesel(table_name = messages)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+//#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ChatMessage {
 	
-	pub id: i32,
+	pub id: String,
 	
 	pub user1: String,
 	pub user2: String,
-	pub sender: i32,
+	pub sender: Sender,
 	
-	pub time: String,
+	pub timestamp: String,
 	pub content: String
 	
 }
+
+impl ChatMessage {
+	
+	pub fn other_user(&self, user_id: &Id) -> &String {
+		
+		let user_id = user_id.to_string();
+		
+		if user_id == self.user1 {
+			&self.user2
+		} else if user_id == self.user2 {
+			&self.user1
+		} else {
+			println!("ChatMessage other_user error; neither user present: {} | {:?}", user_id, self);
+			&self.user1
+		}
+		
+	}
+	
+}
+
 
 
 /*

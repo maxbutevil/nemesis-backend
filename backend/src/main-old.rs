@@ -106,6 +106,16 @@ impl FromRef<AppState> for ClientsState {
 #[tokio::main]
 async fn main() {
 	
+	/*
+	println!("{:?}", serde_json::to_string::<OutgoingMessage>(
+		&OutgoingMessage::Match { user_id: "hello!".to_string() }
+		//&IncomingMessage::Impression { user_id: "hello".to_string(), liked: true }
+	));
+	*/
+	
+	//println!("{:?}", serde_json::from_str::<Profile>("{\"name\": \"hi\"}"));
+	//println!("{:?}", serde_json::from_str::<User>("{\"latitude\":38.9170983,\"longitude\":-119.9272283,\"birthDate\":\"null\"}"));
+	
 	let state = AppState::new().await;
 	
 	use axum::Router;
@@ -118,7 +128,7 @@ async fn main() {
 	let router = Router::new()
 		.nest("/self", self_router)
 		.route("/ws", get(ws_upgrade))
-		//.route("/discover", get(get_discover))
+		.route("/discover", get(get_discover))
 		.route("/matches", get(get_match_data))
 		.fallback(not_found)
 		.with_state(state);
@@ -132,11 +142,12 @@ async fn main() {
 async fn not_found(request: Request) {
 	println!("Invalid endpoint: {}", request.uri());
 }
-/*async fn get_discover(State(db): State<DatabaseState>, auth: FirebaseUser)
+
+async fn get_discover(State(db): State<DatabaseState>, auth: FirebaseUser)
 	-> Result<(StatusCode, Json<Vec<Profile>>), StatusCode> {
 	
 	let id = Id::new(auth.user_id);
-	let result = db.get_queue_profiles(id.clone()).await;
+	let result = db.get_discovery_profiles(id.clone()).await;
 	
 	match result {
 		
@@ -151,14 +162,14 @@ async fn not_found(request: Request) {
 		
 	}
 	
-}*/
+}
 async fn get_match_data(State(db): State<DatabaseState>, auth: FirebaseUser)
 	-> Result<(StatusCode, Json<InitialMatchData>), StatusCode> {
 	
 	let id = Id::new(auth.user_id);
 	
 	let result = tokio::join!(
-		db.get_initial_match_profiles(id.clone()),
+		db.get_matches(id.clone()),
 		db.get_initial_chat_messages(id.clone())
 	);
 	
@@ -184,7 +195,7 @@ async fn get_match_data(State(db): State<DatabaseState>, auth: FirebaseUser)
 async fn read_user(State(db): State<DatabaseState>, auth: FirebaseUser) -> Result<(StatusCode, Json<User>), StatusCode> {
 	
 	let id = Id::new(auth.user_id);
-	let result = db.read_user(&id).await;
+	let result = db.read_user(id.clone()).await;
 	
 	match result {
 		None => {
@@ -227,68 +238,85 @@ async fn ws_upgrade(State(db): State<DatabaseState>, State(ws): State<WebSocketS
 	let id = Id::new(auth.user_id);
 	println!("WebSocket upgrade [{}]", id);
 	
-	request.on_upgrade(move |socket| handle_socket(db, ws, id, socket))
+	request.on_upgrade(move |socket|
+		handle_socket(db, ws, id, socket))
 	
 }
 
-async fn handle_socket(db: DatabaseState, ws: WebSocketState, from_id: Id, socket: WebSocket) {
+async fn handle_socket(db: DatabaseState, ws: WebSocketState, id: Id, socket: WebSocket) {
 	
-	ws.clone().listen(from_id.clone(), socket, move |message| {
-		
-		let (db, ws, from_id) = (db.clone(), ws.clone(), from_id.clone());
+	use ws::Message;
+	use futures_util::StreamExt;
+	
+	let mut receiver = ws.listen(&id, socket);
+	
+	while let Some(message) = receiver.next().await {
 		
 		match message {
-			IncomingMessage::QueueRefresh { blacklist } =>
-				tokio::spawn(async move {
-					handle_queue_refresh(db, ws, from_id, blacklist).await }),
-			IncomingMessage::Impression { to_id, liked } =>
-				tokio::spawn(async move {
-					handle_impression(db, ws, from_id, Id::new(to_id), liked).await }),
-			IncomingMessage::ChatMessage { to_id, content } =>
-				tokio::spawn(async move {
-					handle_chat_message(db, ws, from_id, Id::new(to_id), content).await }),
-		};
+			Ok(Message::Text(data)) => {
+				
+				let result = serde_json::from_str::<IncomingMessage>(&data);
+					
+				match result {
+					Err(err) => println!("IncomingMessage deserialization error: {}", err),
+					Ok(message) => handle_message(&db, &ws, &id, message).await
+				}
+				
+			},
+			Ok(Message::Close(_)) => {},
+			Ok(message) => println!("Invalid message received: {:?}", message),
+			Err(err) => println!("WebSocket receiver error: {}", err)
+		}
 		
-	}).await;
+	}
+	
+	ws.drop(&id).await;
 	
 }
-async fn handle_queue_refresh(db: DatabaseState, ws: WebSocketState, id: Id, blacklist: Option<Vec<String>>) {
+async fn handle_message(db: &DatabaseState, ws: &WebSocketState, sender_id: &Id, message: IncomingMessage) {
 	
-	let result = db.get_queue_profiles(&id, blacklist).await;
-	
-	match result {
+	match message {
 		
-		None => {
-			println!("Error getting user discovery candidates [{}]", id);
-			//Err(StatusCode::UNAUTHORIZED)
+		IncomingMessage::Impression { receiver_id, liked } => {
+			
+			let (db, ws, sender_id) = (db.clone(), ws.clone(), sender_id.clone());
+			
+			tokio::spawn(async move {
+				handle_impression(db, ws, sender_id, Id::new(receiver_id), liked).await
+			});
+			
 		},
-		Some(profiles) => {
-			println!("Getting user discovery candidates [{}]", id);
-			ws.send_soft(&id, OutgoingMessage::QueueRefresh { profiles }).await;
-			//Ok((StatusCode::OK, Json(profiles)))
+		IncomingMessage::ChatMessage { receiver_id, content } => {
+			
+			let (db, ws, sender_id) = (db.clone(), ws.clone(), sender_id.clone());
+			
+			tokio::spawn(async move {
+				handle_chat_message(db, ws, sender_id, Id::new(receiver_id), content).await
+			});
+			
 		}
 		
 	}
 	
 }
-async fn handle_impression(db: DatabaseState, ws: WebSocketState, from_id: Id, to_id: Id, liked: bool) {
+async fn handle_impression(db: DatabaseState, ws: WebSocketState, sender_id: Id, receiver_id: Id, liked: bool) {
 	
-	//println!("Handling impression: {from_id} -> {to_id} | {liked}");
+	//println!("Handling impression: {sender_id} -> {receiver_id} | {liked}");
 	
 	if !liked {
-		db.set_match_state(&from_id, &to_id, MatchState::Dead).await;
+		db.set_match_state(sender_id, receiver_id, MatchState::Dead).await;
 	} else {
 		
-		let current_state = db.get_match_state(&from_id, &to_id).await;
+		let current_state = db.get_match_state(sender_id.clone(), receiver_id.clone()).await;
 		
 		match current_state {
-			None => handle_pending_like(db, ws, from_id, to_id).await,
+			None => handle_pending_like(db, ws, sender_id, receiver_id).await,
 			Some(MatchState::Pending(old_sender)) => {
 				
 				// Ensure that both liked each other, rather than one being duplicated
-				let new_sender = Sender::of(&from_id, &to_id);
+				let new_sender = Sender::of(&sender_id, &receiver_id);
 				if new_sender != old_sender {
-					handle_match(db, ws, from_id, to_id).await;
+					handle_match(db, ws, sender_id, receiver_id).await;
 				} else {
 					// Maybe log like duplication?
 				}
@@ -300,53 +328,55 @@ async fn handle_impression(db: DatabaseState, ws: WebSocketState, from_id: Id, t
 	}
 	
 }
-async fn handle_pending_like(db: DatabaseState, ws: WebSocketState, from_id: Id, to_id: Id) {
+async fn handle_pending_like(db: DatabaseState, ws: WebSocketState, sender_id: Id, receiver_id: Id) {
 	
-	println!("New pending like: [{}] -> [{}]", from_id, to_id);
-	let new_state = MatchState::Pending(Sender::of(&from_id, &to_id));
+	println!("New pending like: [{}] -> [{}]", sender_id, receiver_id);
+	let new_state = MatchState::Pending(Sender::of(&sender_id, &receiver_id));
 	
 	tokio::join!(
-		db.set_match_state(&from_id, &to_id, new_state),
-		ws.try_send(&to_id, OutgoingMessage::Like)
+		db.set_match_state(sender_id, receiver_id.clone(), new_state),
+		ws.try_send(&receiver_id, OutgoingMessage::Like)
 	);
 	
 }
-async fn handle_match(db: DatabaseState, ws: WebSocketState, from_id: Id, to_id: Id) {
+async fn handle_match(db: DatabaseState, ws: WebSocketState, sender_id: Id, receiver_id: Id) {
 	
 	let profiles = tokio::join!(
-		db.get_profile(&from_id),
-		db.get_profile(&to_id)
+		db.get_profile(sender_id.clone()),
+		db.get_profile(receiver_id.clone())
 	);
 	
 	match profiles {
 		
 		(Some(sender), Some(receiver)) => {
-			println!("New match [{}] <-> [{}]", from_id, to_id);
+			println!("New match [{}] <-> [{}]", sender_id, receiver_id);
 			tokio::join!(
-				db.set_match_state(&from_id, &to_id, MatchState::Active),
-				ws.try_send(&from_id, OutgoingMessage::Match { profile: receiver }),
-				ws.try_send(&to_id, OutgoingMessage::Match { profile: sender })
+				db.set_match_state(sender_id.clone(), receiver_id.clone(), MatchState::Active),
+				ws.try_send(&sender_id, OutgoingMessage::Match { profile: receiver }),
+				ws.try_send(&receiver_id, OutgoingMessage::Match { profile: sender })
 			);
 		},
-		(Some(_), None) => println!("Match Error: Couldn't get receiver [{}]", to_id),
-		(None, Some(_)) => println!("Match Error: Couldn't get sender [{}]", from_id),
-		(None, None) => println!("Match Error: Couldn't get profiles [{}] [{}]", from_id, to_id)
+		(Some(_), None) => println!("Match Error: Couldn't get receiver [{}]", receiver_id),
+		(None, Some(_)) => println!("Match Error: Couldn't get sender [{}]", sender_id),
+		(None, None) => println!("Match Error: Couldn't get profiles [{}] [{}]", sender_id, receiver_id)
 		
 	}
 	
+	
+	
 }
-async fn handle_chat_message(db: DatabaseState, ws: WebSocketState, from_id: Id, to_id: Id, content: String) {
+async fn handle_chat_message(db: DatabaseState, ws: WebSocketState, sender_id: Id, receiver_id: Id, content: String) {
 	
 	let message_id = Uuid::new_v4().to_string();
 	
 	tokio::join!(
 		// unfortunate clone of content and id here
-		ws.try_send(&to_id, OutgoingMessage::ChatMessage {
-			from_id: from_id.to_string(),
+		ws.try_send(&receiver_id, OutgoingMessage::ChatMessage {
+			sender_id: sender_id.to_string(),
 			message_id: message_id.clone(),
 			content: content.clone()
 		}),
-		db.put_chat_message(from_id, to_id.clone(), message_id, content)
+		db.put_chat_message(sender_id, receiver_id.clone(), message_id, content)
 	);
 	
 }
