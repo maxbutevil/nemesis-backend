@@ -15,7 +15,7 @@ CREATE TABLE messages (
 	FOREIGN KEY (user2) REFERENCES users(id) ON DELETE CASCADE,
 	CHECK (user1 < user2)
 	
-) STRICT;
+);
 
 CREATE INDEX messages_idx ON messages(user1, user2, timestamp);
 

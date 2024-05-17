@@ -23,4 +23,4 @@ CREATE TABLE users (
 	
 	photos TEXT
 	
-) STRICT;
+);

@@ -17,4 +17,4 @@ CREATE TABLE matches (
 	
 	CHECK (user1 < user2)
 	
-) STRICT;
+);
